@@ -114,7 +114,7 @@ h1{
 .progress-fill{height:100%;background:var(--gold);border-radius:4px;transition:width 0.4s ease;}
 .progress-fill.region{background:var(--coral);}
 
-.link-row{display:flex;gap:8px;margin-top:2px;}
+.link-row{display:flex;gap:8px;margin-top:2px;flex-wrap:wrap;}
 .link-btn{
   display:inline-block;background:var(--surface-2);border:1px solid var(--line);
   color:var(--ice);text-decoration:none;font-size:12px;border-radius:6px;
@@ -123,7 +123,19 @@ h1{
 .link-btn:hover{border-color:var(--gold);color:var(--gold);}
 
 .tilemap-wrap{display:flex;gap:24px;flex-wrap:wrap;align-items:center;}
-.realmap-svg{flex:0 0 auto;}
+.realmap-svg{flex:0 0 auto;cursor:grab;}
+.realmap-svg:active{cursor:grabbing;}
+.map-viewport{position:relative;flex:0 0 auto;}
+.zoom-controls{
+  position:absolute;top:8px;right:8px;display:flex;flex-direction:column;gap:5px;
+}
+.zoom-btn{
+  width:28px;height:28px;border-radius:6px;border:1px solid var(--line);
+  background:var(--surface-2);color:var(--ice);font-size:16px;line-height:1;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+}
+.zoom-btn:hover{border-color:var(--gold);color:var(--gold);}
+.zoom-btn.zoom-reset{font-size:13px;}
 .realmap-svg path{
   stroke:#16221B;stroke-width:0.7;cursor:pointer;transition:opacity 0.15s;
 }
@@ -131,6 +143,19 @@ h1{
 .realmap-svg path.active{stroke:var(--coral);stroke-width:2;}
 .realmap-svg .sejong-dot{cursor:pointer;stroke:#16221B;stroke-width:0.7;}
 .realmap-svg .sejong-dot.active{stroke:var(--coral);stroke-width:1.6;}
+.realmap-svg .city-label{
+  fill:#F1F0E6;stroke:#16221B;stroke-width:0.55;paint-order:stroke;
+  font-family:'IBM Plex Sans KR',sans-serif;pointer-events:none;user-select:none;
+}
+.realmap-svg .landed-marker{pointer-events:none;}
+.realmap-svg .marker-pulse{
+  transform-origin:center;transform-box:fill-box;
+  animation:marker-pulse 1.6s ease-out infinite;
+}
+@keyframes marker-pulse{
+  0%{ transform:scale(0.6); opacity:0.9; }
+  100%{ transform:scale(2.4); opacity:0; }
+}
 .tilemap-legend{display:flex;flex-direction:column;gap:8px;min-width:150px;}
 .legend-scale{display:flex;align-items:center;gap:6px;}
 .legend-bar{width:90px;height:10px;border-radius:5px;background:linear-gradient(90deg, var(--surface-2), var(--gold));}
@@ -182,12 +207,19 @@ h1{
   <div class="panel" style="margin-bottom:20px;">
     <p class="panel-title">전국 방문 지도 (시·군 단위)</p>
     <div class="tilemap-wrap">
-      <svg class="realmap-svg" id="realmap-svg" width="300" height="300"></svg>
+      <div class="map-viewport" id="map-viewport">
+        <svg class="realmap-svg" id="realmap-svg" width="300" height="300"></svg>
+        <div class="zoom-controls">
+          <button class="zoom-btn" id="zoom-in-btn" title="확대">+</button>
+          <button class="zoom-btn" id="zoom-out-btn" title="축소">−</button>
+          <button class="zoom-btn zoom-reset" id="zoom-reset-btn" title="전체보기">⤢</button>
+        </div>
+      </div>
       <div class="tilemap-legend">
         <div class="legend-scale">
           <div class="legend-bar"></div>
         </div>
-        <p class="legend-text">색이 진할수록 그 시·군 방문률이 높다는 뜻이에요. 클릭하면 그 지역/시·군으로 바로 이동합니다. 스팟이 아직 없는 시·군은 회색으로 표시돼요.</p>
+        <p class="legend-text">색이 진할수록 그 시·군 방문률이 높다는 뜻이에요. 클릭하면 그 지역/시·군으로 이동하면서 지도가 그쪽으로 확대돼요. 마우스 휠이나 드래그로도 확대·이동할 수 있어요.</p>
         <p class="map-tooltip" id="map-tooltip"></p>
       </div>
     </div>
@@ -926,6 +958,7 @@ const KEY_LAST_REGION = 'roulette-last-region';
 let visited = {};
 let currentRegionKey = 'gyeongbuk';
 let landedSpotName = null;
+let landedMarker = null;
 
 let audioCtx = null;
 function getAudioCtx(){
@@ -1028,6 +1061,49 @@ function lerpColor(hexA, hexB, t){
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
+function parsePathSubpaths(dString){
+  return dString.split('M').map(s=>s.trim()).filter(s=>s.length>0).map(sp=>{
+    const cleaned = sp.replace(/Z\s*$/,'').trim();
+    return cleaned.split('L').map(pair=>{
+      const [x,y] = pair.trim().split(',').map(Number);
+      return [x,y];
+    });
+  });
+}
+
+function polygonAreaCentroid(pts){
+  let area=0, cx=0, cy=0;
+  for(let i=0;i<pts.length;i++){
+    const [x0,y0]=pts[i];
+    const [x1,y1]=pts[(i+1)%pts.length];
+    const cross = x0*y1 - x1*y0;
+    area += cross;
+    cx += (x0+x1)*cross;
+    cy += (y0+y1)*cross;
+  }
+  area/=2;
+  if(Math.abs(area)<1e-6){
+    const n=pts.length;
+    return { area:0, cx: pts.reduce((s,p)=>s+p[0],0)/n, cy: pts.reduce((s,p)=>s+p[1],0)/n, bboxW:0, bboxH:0 };
+  }
+  let minx=Infinity,maxx=-Infinity,miny=Infinity,maxy=-Infinity;
+  pts.forEach(([x,y])=>{minx=Math.min(minx,x);maxx=Math.max(maxx,x);miny=Math.min(miny,y);maxy=Math.max(maxy,y);});
+  return { area: Math.abs(area), cx: cx/(6*area), cy: cy/(6*area), bboxW: maxx-minx, bboxH: maxy-miny };
+}
+
+const CITY_LABEL_CACHE = {};
+function cityLabelAnchor(pathD, cacheKey){
+  if(CITY_LABEL_CACHE[cacheKey]) return CITY_LABEL_CACHE[cacheKey];
+  const subpaths = parsePathSubpaths(pathD);
+  let best = null;
+  subpaths.forEach(pts=>{
+    const res = polygonAreaCentroid(pts);
+    if(!best || res.area > best.area) best = res;
+  });
+  CITY_LABEL_CACHE[cacheKey] = best;
+  return best;
+}
+
 function regionPct(key){
   const region = REGIONS[key];
   const total = region.spots.length;
@@ -1042,13 +1118,163 @@ function cityPct(regionKey, cityName){
   return visitedN/spots.length;
 }
 
+let currentViewBox = { x:0, y:0, w:0, h:0 };
+let mapInitialized = false;
+
+function getPathBBox(pathD){
+  const subpaths = parsePathSubpaths(pathD);
+  let minx=Infinity,maxx=-Infinity,miny=Infinity,maxy=-Infinity;
+  subpaths.forEach(pts=> pts.forEach(([x,y])=>{
+    minx=Math.min(minx,x); maxx=Math.max(maxx,x);
+    miny=Math.min(miny,y); maxy=Math.max(maxy,y);
+  }));
+  return { minx, miny, maxx, maxy, w:maxx-minx, h:maxy-miny };
+}
+
+function clampViewBox(vb){
+  const minW = 12, minH = 12;
+  let w = Math.max(minW, Math.min(NATIONAL_MAP_W, vb.w));
+  let h = Math.max(minH, Math.min(NATIONAL_MAP_H, vb.h));
+  let x = Math.max(-w*0.3, Math.min(NATIONAL_MAP_W - w*0.7, vb.x));
+  let y = Math.max(-h*0.3, Math.min(NATIONAL_MAP_H - h*0.7, vb.y));
+  return {x,y,w,h};
+}
+
+function applyViewBox(){
+  const svg = document.getElementById('realmap-svg');
+  const vb = currentViewBox;
+  svg.setAttribute('viewBox', `${vb.x.toFixed(2)} ${vb.y.toFixed(2)} ${vb.w.toFixed(2)} ${vb.h.toFixed(2)}`);
+}
+
+function animateViewBox(target, duration){
+  const start = {...currentViewBox};
+  const t0 = performance.now();
+  function step(now){
+    const t = Math.min(1, (now-t0)/duration);
+    const ease = 1 - Math.pow(1-t, 3);
+    currentViewBox = {
+      x: start.x + (target.x-start.x)*ease,
+      y: start.y + (target.y-start.y)*ease,
+      w: start.w + (target.w-start.w)*ease,
+      h: start.h + (target.h-start.h)*ease
+    };
+    applyViewBox();
+    if(t<1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function zoomToBBox(bbox){
+  const padW = bbox.w*0.25 + 4, padH = bbox.h*0.25 + 4;
+  const target = clampViewBox({
+    x: bbox.minx-padW, y: bbox.miny-padH,
+    w: bbox.w+padW*2, h: bbox.h+padH*2
+  });
+  animateViewBox(target, 500);
+}
+
+function resetView(){
+  animateViewBox({x:0,y:0,w:NATIONAL_MAP_W,h:NATIONAL_MAP_H}, 450);
+}
+
+function zoomByFactor(factor){
+  const vb = currentViewBox;
+  const cx = vb.x+vb.w/2, cy = vb.y+vb.h/2;
+  const w = vb.w*factor, h = vb.h*factor;
+  currentViewBox = clampViewBox({ x: cx-w/2, y: cy-h/2, w, h });
+  applyViewBox();
+}
+
+let mapDragMoved = false;
+
+function setupMapInteractions(){
+  const svg = document.getElementById('realmap-svg');
+  const viewport = document.getElementById('map-viewport');
+
+  svg.addEventListener('wheel', (e)=>{
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const px = (e.clientX-rect.left)/rect.width;
+    const py = (e.clientY-rect.top)/rect.height;
+    const vb = currentViewBox;
+    const pointX = vb.x + px*vb.w, pointY = vb.y + py*vb.h;
+    const factor = e.deltaY > 0 ? 1.15 : 0.87;
+    const w = vb.w*factor, h = vb.h*factor;
+    currentViewBox = clampViewBox({
+      x: pointX - px*w, y: pointY - py*h, w, h
+    });
+    applyViewBox();
+  }, { passive:false });
+
+  let dragStart = null;
+  function panStart(clientX, clientY){
+    dragStart = { x:clientX, y:clientY, vb:{...currentViewBox} };
+    mapDragMoved = false;
+  }
+  function panMove(clientX, clientY){
+    if(!dragStart) return;
+    const rect = svg.getBoundingClientRect();
+    const dx = (clientX-dragStart.x)/rect.width * dragStart.vb.w;
+    const dy = (clientY-dragStart.y)/rect.height * dragStart.vb.h;
+    if(Math.abs(clientX-dragStart.x) > 3 || Math.abs(clientY-dragStart.y) > 3) mapDragMoved = true;
+    currentViewBox = clampViewBox({
+      x: dragStart.vb.x - dx, y: dragStart.vb.y - dy,
+      w: dragStart.vb.w, h: dragStart.vb.h
+    });
+    applyViewBox();
+  }
+  function panEnd(){ dragStart = null; }
+
+  svg.addEventListener('mousedown', (e)=> panStart(e.clientX, e.clientY));
+  window.addEventListener('mousemove', (e)=>{ if(dragStart) panMove(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', panEnd);
+
+  let pinchStartDist = null, pinchStartVB = null;
+  svg.addEventListener('touchstart', (e)=>{
+    if(e.touches.length===1){
+      panStart(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length===2){
+      const [a,b] = e.touches;
+      pinchStartDist = Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
+      pinchStartVB = {...currentViewBox};
+    }
+  }, { passive:true });
+  svg.addEventListener('touchmove', (e)=>{
+    if(e.touches.length===1 && dragStart){
+      panMove(e.touches[0].clientX, e.touches[0].clientY);
+    } else if(e.touches.length===2 && pinchStartDist){
+      e.preventDefault();
+      const [a,b] = e.touches;
+      const dist = Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
+      const factor = pinchStartDist/Math.max(dist,1);
+      const cx = pinchStartVB.x+pinchStartVB.w/2, cy = pinchStartVB.y+pinchStartVB.h/2;
+      currentViewBox = clampViewBox({
+        x: cx-(pinchStartVB.w*factor)/2, y: cy-(pinchStartVB.h*factor)/2,
+        w: pinchStartVB.w*factor, h: pinchStartVB.h*factor
+      });
+      applyViewBox();
+    }
+  }, { passive:false });
+  svg.addEventListener('touchend', ()=>{ panEnd(); pinchStartDist=null; });
+
+  document.getElementById('zoom-in-btn').addEventListener('click', ()=> zoomByFactor(0.7));
+  document.getElementById('zoom-out-btn').addEventListener('click', ()=> zoomByFactor(1.4));
+  document.getElementById('zoom-reset-btn').addEventListener('click', resetView);
+}
+
 function renderTilemap(){
   const svg = document.getElementById('realmap-svg');
-  svg.setAttribute('viewBox', NATIONAL_MAP_VIEWBOX);
   svg.setAttribute('width', NATIONAL_MAP_W);
   svg.setAttribute('height', NATIONAL_MAP_H);
+  if(!mapInitialized){
+    currentViewBox = { x:0, y:0, w:NATIONAL_MAP_W, h:NATIONAL_MAP_H };
+    mapInitialized = true;
+    setupMapInteractions();
+  }
+  applyViewBox();
 
   let content = '';
+  let labels = '';
   Object.keys(NATIONAL_CITY_PATHS).forEach(regionKey=>{
     const cities = NATIONAL_CITY_PATHS[regionKey];
     Object.keys(cities).forEach(cityName=>{
@@ -1057,7 +1283,14 @@ function renderTilemap(){
       const bg = hasData ? lerpColor('#2B4232', '#E3B23C', pct) : '#3A4A40';
       const isActive = (regionKey === currentRegionKey) && (cityName === document.getElementById('city-select').value);
       const label = hasData ? `${REGIONS[regionKey].name} ${cityName} — ${Math.round(pct*100)}% 방문` : `${REGIONS[regionKey].name} ${cityName} — 등록된 스팟 없음`;
-      content += `<path d="${cities[cityName]}" fill="${bg}" fill-rule="evenodd" class="${isActive?'active':''}" data-region="${regionKey}" data-city="${cityName}" data-hasdata="${hasData}"><title>${label}</title></path>`;
+      const pathD = cities[cityName];
+      content += `<path d="${pathD}" fill="${bg}" fill-rule="evenodd" class="${isActive?'active':''}" data-region="${regionKey}" data-city="${cityName}" data-hasdata="${hasData}"><title>${label}</title></path>`;
+
+      const anchor = cityLabelAnchor(pathD, regionKey+'|'+cityName);
+      if(anchor && anchor.bboxW > 7 && anchor.bboxH > 6){
+        const fontSize = Math.max(2.4, Math.min(5, Math.min(anchor.bboxW, anchor.bboxH)*0.32));
+        labels += `<text x="${anchor.cx.toFixed(1)}" y="${anchor.cy.toFixed(1)}" font-size="${fontSize.toFixed(1)}" text-anchor="middle" dominant-baseline="middle" class="city-label">${cityName}</text>`;
+      }
     });
   });
   const sejongPct = regionPct('sejong');
@@ -1065,17 +1298,45 @@ function renderTilemap(){
   const sejongActive = currentRegionKey === 'sejong';
   content += `<circle class="sejong-dot ${sejongActive?'active':''}" cx="${SEJONG_POINT[0]}" cy="${SEJONG_POINT[1]}" r="4" fill="${sejongColor}" data-region="sejong"><title>세종특별자치시 ${Math.round(sejongPct*100)}%</title></circle>`;
 
-  svg.innerHTML = content;
+  let markerSvg = '';
+  if(landedMarker){
+    let mx, my;
+    if(landedMarker.regionKey === 'sejong'){
+      mx = SEJONG_POINT[0]; my = SEJONG_POINT[1];
+    } else {
+      const pathD = NATIONAL_CITY_PATHS[landedMarker.regionKey] && NATIONAL_CITY_PATHS[landedMarker.regionKey][landedMarker.cityName];
+      if(pathD){
+        const anchor = cityLabelAnchor(pathD, landedMarker.regionKey+'|'+landedMarker.cityName);
+        mx = anchor.cx; my = anchor.cy;
+      }
+    }
+    if(mx !== undefined){
+      markerSvg = `<g class="landed-marker" transform="translate(${mx.toFixed(1)},${my.toFixed(1)})">
+        <circle r="7" fill="none" stroke="var(--coral)" stroke-width="1.4" class="marker-pulse"/>
+        <path d="M0,-11 C4.5,-11 7.5,-7.8 7.5,-4 C7.5,1.5 0,10 0,10 C0,10 -7.5,1.5 -7.5,-4 C-7.5,-7.8 -4.5,-11 0,-11 Z" fill="var(--coral)" stroke="#16221B" stroke-width="0.6"/>
+        <circle r="2.6" fill="#16221B" cy="-4"/>
+      </g>`;
+    }
+  }
+
+  svg.innerHTML = content + labels + markerSvg;
 
   svg.querySelectorAll('[data-region]').forEach(el=>{
     const regionKey = el.getAttribute('data-region');
     const cityName = el.getAttribute('data-city');
     el.addEventListener('click', ()=>{
+      if(mapDragMoved){ mapDragMoved = false; return; }
       const sel = document.getElementById('region-select');
       const needsRegionChange = sel.value !== regionKey;
       sel.value = regionKey;
       if(needsRegionChange){
         sel.dispatchEvent(new Event('change'));
+      }
+      const pathD = el.getAttribute('d');
+      if(pathD){
+        zoomToBBox(getPathBBox(pathD));
+      } else {
+        zoomToBBox({ minx: SEJONG_POINT[0]-14, miny: SEJONG_POINT[1]-14, maxx: SEJONG_POINT[0]+14, maxy: SEJONG_POINT[1]+14, w:28, h:28 });
       }
       if(cityName){
         const hasData = el.getAttribute('data-hasdata') === 'true';
@@ -1125,8 +1386,12 @@ function updateStats(){
 
 function mapLinks(regionName, cityName, spotName){
   const q = encodeURIComponent(`${cityName} ${spotName}`);
+  const foodQ = encodeURIComponent(`${cityName} 맛집`);
+  const imgQ = encodeURIComponent(`${cityName} ${spotName}`);
   return `<a class="link-btn" href="https://map.kakao.com/link/search/${q}" target="_blank" rel="noopener">카카오맵에서 보기</a>` +
-         `<a class="link-btn" href="https://map.naver.com/p/search/${q}" target="_blank" rel="noopener">네이버맵에서 보기</a>`;
+         `<a class="link-btn" href="https://map.naver.com/p/search/${q}" target="_blank" rel="noopener">네이버맵에서 보기</a>` +
+         `<a class="link-btn" href="https://map.naver.com/p/search/${foodQ}" target="_blank" rel="noopener">${cityName} 맛집 보기</a>` +
+         `<a class="link-btn" href="https://search.naver.com/search.naver?where=image&query=${imgQ}" target="_blank" rel="noopener">사진 보기</a>`;
 }
 
 function populateRegionSelect(){
@@ -1275,6 +1540,7 @@ document.getElementById('spin-btn').addEventListener('click', ()=>{
     clearInterval(tickTimer);
     const spot = spots[winIndex];
     landedSpotName = spot.n;
+    landedMarker = { regionKey: currentRegionKey, cityName: spot.c };
     document.getElementById('result-region').textContent = REGIONS[currentRegionKey].name + ' · ' + spot.c;
     document.getElementById('result-name').textContent = spot.n;
     document.getElementById('result-blurb').textContent = spot.b;
@@ -1282,6 +1548,11 @@ document.getElementById('spin-btn').addEventListener('click', ()=>{
     document.getElementById('result-card').style.display = 'block';
     playFanfare();
     fireConfetti();
+
+    const cityPathD = NATIONAL_CITY_PATHS[currentRegionKey] && NATIONAL_CITY_PATHS[currentRegionKey][spot.c];
+    if(cityPathD){
+      zoomToBBox(getPathBBox(cityPathD));
+    }
 
     const key = visitedKey(currentRegionKey, spot.n);
     const isVisited = !!visited[key];
